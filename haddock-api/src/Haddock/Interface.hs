@@ -44,18 +44,20 @@ import Haddock.Utils
 
 import Control.Monad
 import Control.Exception (evaluate)
+import Data.IORef
 import Data.List
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 import Text.Printf
 
 import Module (mkModuleSet, emptyModuleSet, unionModuleSet, ModuleSet)
-import Digraph
 import DynFlags hiding (verbosity)
 import GHC hiding (verbosity)
+import GhcMonad (Session(..), modifySession, reflectGhc)
+import Hooks
 import HscTypes
 import FastString (unpackFS)
-import TcRnTypes (tcg_rdr_env)
+import TcRnTypes (FrontendResult(..), tcg_rdr_env)
 import Name (nameIsFromExternalPackage, nameOccName)
 import OccName (isTcOcc)
 import RdrName (unQualOK, gre_name, globalRdrEnvElts)
@@ -120,34 +122,61 @@ processModules verbosity modules flags extIfaces = do
 -- * Module typechecking and Interface creation
 --------------------------------------------------------------------------------
 
-
 createIfaces :: Verbosity -> [String] -> [Flag] -> InstIfaceMap -> Ghc ([Interface], ModuleSet)
 createIfaces verbosity modules flags instIfaceMap = do
   -- Ask GHC to tell us what the module graph is
   targets <- mapM (\filePath -> guessTarget filePath Nothing) modules
   setTargets targets
-  modGraph <- depanal [] False
 
   -- Visit modules in that order
-  let sortedMods = flattenSCCs $ topSortModuleGraph False modGraph Nothing
   out verbosity normal "Haddock coverage:"
-  (ifaces, _, !ms) <- foldM f ([], Map.empty, emptyModuleSet) sortedMods
-  return (reverse ifaces, ms)
+
+  ifaceMapRef <- liftIO $ newIORef (Map.empty, emptyModuleSet)
+  loadOk <- {-# SCC load #-}
+            withTiming getDynFlags "load" (const ()) $
+              gbracket_
+                (modifySession $ setHooks $ emptyHooks
+                  { hscFrontendHook = Just $ hook ifaceMapRef
+                  })
+                (modifySession $ setHooks emptyHooks) $
+                GHC.load LoadAllTargets
+  case loadOk of
+    GHC.Succeeded -> do
+      (ifaceMap, !ms) <- liftIO $ atomicModifyIORef' ifaceMapRef $ \i ->
+        ((Map.empty, emptyModuleSet), i)
+      modGraph <- GHC.getModuleGraph
+      return
+        ( [ ifaceMap Map.! ms_mod modsum
+          | modsum <- mgModSummaries modGraph
+          , not $ isBootSummary modsum
+          ]
+        , ms )
+    GHC.Failed -> throwE "Cannot typecheck modules"
   where
-    f (ifaces, ifaceMap, !ms) modSummary = do
-      x <- {-# SCC processModule #-}
-           withTiming getDynFlags "processModule" (const ()) $ do
-             processModule verbosity modSummary flags ifaceMap instIfaceMap
-      return $ case x of
-        Just (iface, ms') -> ( iface:ifaces
-                             , Map.insert (ifaceMod iface) iface ifaceMap
-                             , unionModuleSet ms ms' )
-        Nothing           -> ( ifaces
-                             , ifaceMap
-                             , ms ) -- Boot modules don't generate ifaces.
+    setHooks :: Hooks -> HscEnv -> HscEnv
+    setHooks h hsc_env = hsc_env
+      { hsc_dflags = (hsc_dflags hsc_env){ hooks = h }
+      }
 
+    hook :: IORef (IfaceMap, ModuleSet) -> ModSummary -> Hsc FrontendResult
+    hook modMapRef modsum = Hsc $ \e w -> do
+      (modMap, _ms) <- liftIO $ readIORef modMapRef
+      -- This is a hack to avoid changing the rest type from Ghc to Hsc
+      session <- Session <$> newIORef e
+      (tm, maybeIface) <- flip reflectGhc session $
+        -- TODO: handle concurrent output in processModule
+        processModule verbosity modsum flags modMap instIfaceMap
+      case maybeIface of
+        Just (iface, ms) -> atomicModifyIORef' modMapRef $ \(ifaceMap, ms') ->
+          ( ( Map.insert (ifaceMod iface) iface ifaceMap
+            , unionModuleSet ms ms' )
+          , ())
+        Nothing -> return ()
+      return (FrontendTypecheck $ fst $ GHC.tm_internals_ tm, w)
 
-processModule :: Verbosity -> ModSummary -> [Flag] -> IfaceMap -> InstIfaceMap -> Ghc (Maybe (Interface, ModuleSet))
+processModule
+  :: Verbosity -> ModSummary -> [Flag] -> IfaceMap -> InstIfaceMap
+  -> Ghc (TypecheckedModule, Maybe (Interface, ModuleSet))
 processModule verbosity modsum flags modMap instIfaceMap = do
   out verbosity verbose $ "Checking module " ++ moduleString (ms_mod modsum) ++ "..."
 
@@ -156,7 +185,7 @@ processModule verbosity modsum flags modMap instIfaceMap = do
   dynflags' <- liftIO (initializePlugins hsc_env' (GHC.ms_hspp_opts modsum))
   let modsum' = modsum { ms_hspp_opts = dynflags' }
 
-  tm <- {-# SCC "parse/typecheck/load" #-} loadModule =<< typecheckModule =<< parseModule modsum'
+  tm <- {-# SCC "parse/typecheck" #-} typecheckModule =<< parseModule modsum'
 
   if not $ isBootSummary modsum then do
     out verbosity verbose "Creating interface..."
@@ -211,9 +240,9 @@ processModule verbosity modsum flags modMap instIfaceMap = do
         unless header $ out verbosity normal "    Module header"
         mapM_ (out verbosity normal . ("    " ++)) undocumentedExports
     interface' <- liftIO $ evaluate interface
-    return (Just (interface', mods))
+    return (tm, Just (interface', mods))
   else
-    return Nothing
+    return (tm, Nothing)
 
 
 --------------------------------------------------------------------------------
