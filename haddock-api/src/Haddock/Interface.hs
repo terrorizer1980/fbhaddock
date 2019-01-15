@@ -43,6 +43,7 @@ import Haddock.Types
 import Haddock.Utils
 
 import Control.Monad
+import Data.IORef
 import Data.List
 import qualified Data.Map as Map
 import qualified Data.Set as Set
@@ -51,14 +52,15 @@ import System.Directory
 import System.FilePath
 import Text.Printf
 
-import Digraph
 import DynFlags hiding (verbosity)
 import Exception
 import GHC hiding (verbosity)
+import GhcMonad (Session(..), modifySession, reflectGhc)
+import Hooks
 import HscTypes
 import FastString (unpackFS)
 import MonadUtils (liftIO)
-import TcRnTypes (tcg_rdr_env)
+import TcRnTypes (FrontendResult(..), tcg_rdr_env)
 import RdrName (plusGlobalRdrEnv)
 import ErrUtils (withTiming)
 
@@ -126,8 +128,28 @@ createIfaces0 verbosity modules flags instIfaceMap =
   -- compute output file names that are stored in the DynFlags of the
   -- resulting ModSummaries.
   (if useTempDir then withTempOutputDir else id) $ do
-    modGraph <- depAnalysis
-    createIfaces verbosity flags instIfaceMap modGraph
+    targets <- mapM (\f -> guessTarget f Nothing) modules
+    setTargets targets
+    ifaceMapRef <- liftIO $ newIORef Map.empty
+    loadOk <- {-# SCC load #-}
+              withTiming getDynFlags "load" (const ()) $
+                gbracket_
+                  (modifySession $ setHooks $ emptyHooks
+                    { hscFrontendHook = Just $ hook ifaceMapRef
+                    })
+                  (modifySession $ setHooks emptyHooks) $
+                  GHC.load LoadAllTargets
+    case loadOk of
+      GHC.Succeeded -> do
+        ifaceMap <- liftIO $ atomicModifyIORef' ifaceMapRef $ \i ->
+          (Map.empty, i)
+        modGraph <- GHC.getModuleGraph
+        return
+          [ ifaceMap Map.! ms_mod modsum
+          | modsum <- mgModSummaries modGraph
+          , not $ isBootSummary modsum
+          ]
+      GHC.Failed -> throwE "Cannot typecheck modules"
 
   where
     useTempDir :: Bool
@@ -143,13 +165,28 @@ createIfaces0 verbosity modules flags instIfaceMap =
       withTempDir dir action
 
 
-    depAnalysis :: Ghc ModuleGraph
-    depAnalysis = do
-      targets <- mapM (\f -> guessTarget f Nothing) modules
-      setTargets targets
-      depanal [] False
+    setHooks :: Hooks -> HscEnv -> HscEnv
+    setHooks h hsc_env = hsc_env
+      { hsc_dflags = (hsc_dflags hsc_env){ hooks = h }
+      }
 
 
+    hook :: IORef IfaceMap -> ModSummary -> Hsc FrontendResult
+    hook modMapRef modsum = Hsc $ \e w -> do
+      modMap <- liftIO $ readIORef modMapRef
+      -- This is a hack to avoid changing the rest type from Ghc to Hsc
+      session <- Session <$> newIORef e
+      (tm, maybeIface) <- flip reflectGhc session $
+        -- TODO: handle concurrent output in processModule
+        processModule verbosity modsum flags modMap instIfaceMap
+      case maybeIface of
+        Just iface -> atomicModifyIORef' modMapRef $ \ifaceMap ->
+          (Map.insert (ifaceMod iface) iface ifaceMap, ())
+        Nothing -> return ()
+      return (FrontendTypecheck $ fst $ GHC.tm_internals_ tm, w)
+
+
+{-
 createIfaces :: Verbosity -> [Flag] -> InstIfaceMap -> ModuleGraph -> Ghc [Interface]
 createIfaces verbosity flags instIfaceMap mods = do
   let sortedMods = flattenSCCs $ topSortModuleGraph False mods Nothing
@@ -164,12 +201,15 @@ createIfaces verbosity flags instIfaceMap mods = do
       return $ case x of
         Just iface -> (iface:ifaces, Map.insert (ifaceMod iface) iface ifaceMap)
         Nothing    -> (ifaces, ifaceMap) -- Boot modules don't generate ifaces.
+-}
 
 
-processModule :: Verbosity -> ModSummary -> [Flag] -> IfaceMap -> InstIfaceMap -> Ghc (Maybe Interface)
+processModule
+  :: Verbosity -> ModSummary -> [Flag] -> IfaceMap -> InstIfaceMap
+  -> Ghc (TypecheckedModule, Maybe Interface)
 processModule verbosity modsum flags modMap instIfaceMap = do
   out verbosity verbose $ "Checking module " ++ moduleString (ms_mod modsum) ++ "..."
-  tm <- {-# SCC "parse/typecheck/load" #-} loadModule =<< typecheckModule =<< parseModule modsum
+  tm <- {-# SCC "parse/typecheck" #-} typecheckModule =<< parseModule modsum
 
   -- We need to modify the interactive context's environment so that when
   -- Haddock later looks for instances, it also looks in the modules it
@@ -220,9 +260,9 @@ processModule verbosity modsum flags modMap instIfaceMap = do
         unless header $ out verbosity normal "    Module header"
         mapM_ (out verbosity normal . ("    " ++)) undocumentedExports
     interface' <- liftIO $ evaluate interface
-    return (Just interface')
+    return (tm, Just interface')
   else
-    return Nothing
+    return (tm, Nothing)
 
 
 --------------------------------------------------------------------------------
