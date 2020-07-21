@@ -127,8 +127,8 @@ createIfaces verbosity modules flags instIfaceMap = do
   -- Ask GHC to tell us what the module graph is
   targets <- mapM (\filePath -> guessTarget filePath Nothing) modules
   setTargets targets
+  _modGraph <- depanal [] False
 
-  -- Visit modules in that order
   out verbosity normal "Haddock coverage:"
 
   ifaceMapRef <- liftIO $ newIORef (Map.empty, emptyModuleSet)
@@ -144,13 +144,7 @@ createIfaces verbosity modules flags instIfaceMap = do
     GHC.Succeeded -> do
       (ifaceMap, !ms) <- liftIO $ atomicModifyIORef' ifaceMapRef $ \i ->
         ((Map.empty, emptyModuleSet), i)
-      modGraph <- GHC.getModuleGraph
-      return
-        ( [ ifaceMap Map.! ms_mod modsum
-          | modsum <- mgModSummaries modGraph
-          , not $ isBootSummary modsum
-          ]
-        , ms )
+      return (Map.elems ifaceMap, ms)
     GHC.Failed -> throwE "Cannot typecheck modules"
   where
     setHooks :: Hooks -> HscEnv -> HscEnv
